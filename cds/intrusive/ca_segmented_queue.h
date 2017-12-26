@@ -39,6 +39,7 @@
 #include <cds/opt/permutation.h>
 
 #include <boost/intrusive/slist.hpp>
+#include <boost/thread/tss.hpp> // thread_specific_ptr
 
 #if CDS_COMPILER == CDS_COMPILER_MSVC
 #   pragma warning( push )
@@ -261,9 +262,10 @@ namespace cds { namespace intrusive {
         typedef typename traits::item_counter  item_counter;   ///< Item counting policy, see cds::opt::item_counter option setter
         typedef typename traits::stat          stat;   ///< Internal statistics policy
         typedef typename traits::lock_type     lock_type;   ///< Type of mutex for maintaining an internal list of allocated segments.
-        typedef typename traits::permutation_generator permutation_generator; ///< Random permutation generator for sequence [0, quasi-factor)
+        typedef typename traits::permutation_generator permutation_generator; ///< Skew permutation generator for sequence [0, quasi-factor)
 
         static const size_t c_nHazardPtrCount = 2 ; ///< Count of hazard pointer required for the algorithm
+
 
     protected:
         //@cond
@@ -317,6 +319,13 @@ namespace cds { namespace intrusive {
             size_t const        m_nQuasiFactor;
             stat&               m_Stat;
 
+        public:         // TLS variables
+            boost::thread_specific_ptr<int> tls_iHead;
+            boost::thread_specific_ptr<int> tls_iTail;
+
+            boost::thread_specific_ptr<segment> tls_pHead;
+            boost::thread_specific_ptr<segment> tls_pTail;
+
         private:
             struct segment_disposer
             {
@@ -342,6 +351,8 @@ namespace cds { namespace intrusive {
                 , m_pTail( nullptr )
                 , m_nQuasiFactor( nQuasiFactor )
                 , m_Stat( st )
+                , tls_pHead( tls_segment_cleanup )
+                , tls_pTail( tls_segment_cleanup )
             {
                 assert( cds::beans::is_power2( nQuasiFactor ));
             }
@@ -409,6 +420,10 @@ namespace cds { namespace intrusive {
                     m_pHead.store( pNew, memory_model::memory_order_release );
                 m_List.push_back( *pNew );
                 m_pTail.store( pNew, memory_model::memory_order_release );
+
+                tls_pTail.reset( pNew );
+                tls_iTail.reset( new int(0) );
+
                 return guard.assign( pNew );
             }
 
@@ -449,6 +464,9 @@ namespace cds { namespace intrusive {
                 retire_segment( pHead );
                 m_Stat.onSegmentDeleted();
 
+                tls_pHead.reset(pRet);
+                tls_iHead.reset(new int( m_nQuasiFactor - 1 ));
+
                 return pRet;
             }
 
@@ -478,6 +496,11 @@ namespace cds { namespace intrusive {
             static void retire_segment( segment * pSegment )
             {
                 gc::template retire<segment_disposer>( pSegment );
+            }
+
+            static void tls_segment_cleanup( segment * )
+            {
+                return;
             }
         };
         //@endcond
@@ -521,13 +544,21 @@ namespace cds { namespace intrusive {
                 assert( pTailSegment );
             }
 
-            permutation_generator gen(0, quasi_factor());
-
             // First, increment item counter.
             // We sure that the item will be enqueued
             // but if we increment the counter after inserting we can get a negative counter value
             // if dequeuing occurs before incrementing (enqueue/dequeue race)
             ++m_ItemCounter;
+
+            if ( m_SegmentList.tls_pTail.get() != pTailSegment ){
+                m_SegmentList.tls_pTail.reset(pTailSegment);
+                m_SegmentList.tls_iTail.reset( new int(0) );
+            }
+
+            int * iTail = m_SegmentList.tls_iTail.get();
+            int startGen = iTail ? *iTail: 0;
+
+            permutation_generator gen(startGen, quasi_factor());
 
             while ( true ) {
                 CDS_DEBUG_ONLY( size_t nLoopCount = 0);
@@ -544,6 +575,8 @@ namespace cds { namespace intrusive {
                         if ( pTailSegment->cells[i].data.compare_exchange_strong( nullCell, regular_cell( &val ),
                             memory_model::memory_order_release, atomics::memory_order_relaxed ))
                         {
+                            m_SegmentList.tls_iTail.reset( new int(i) );
+
                             // Ok to push item
                             m_Stat.onPush();
                             return true;
@@ -679,7 +712,14 @@ namespace cds { namespace intrusive {
             typename gc::Guard segmentGuard;
             segment * pHeadSegment = m_SegmentList.head( segmentGuard );
 
-            permutation_generator gen(0, quasi_factor());
+            if(m_SegmentList.tls_pHead.get() != pHeadSegment){
+                m_SegmentList.tls_pHead.reset(pHeadSegment);
+                m_SegmentList.tls_iHead.reset( new int(0) );
+            }
+
+            int * iHead = m_SegmentList.tls_iHead.get();
+            int startGen = iHead ? *iHead : 0;
+
             while ( true ) {
                 if ( !pHeadSegment ) {
                     // Queue is empty
@@ -689,6 +729,9 @@ namespace cds { namespace intrusive {
 
                 bool bHadNullValue = false;
                 regular_cell item;
+
+                permutation_generator gen(startGen, quasi_factor());
+
                 CDS_DEBUG_ONLY( size_t nLoopCount = 0 );
                 do {
                     typename permutation_generator::integer_type i = gen;
@@ -711,6 +754,8 @@ namespace cds { namespace intrusive {
                             if ( pHeadSegment->cells[i].data.compare_exchange_strong( item, item | 1,
                                 memory_model::memory_order_acquire, atomics::memory_order_relaxed ))
                             {
+                                m_SegmentList.tls_iHead.reset( new int(i) );
+
                                 --m_ItemCounter;
                                 m_Stat.onPop();
 
