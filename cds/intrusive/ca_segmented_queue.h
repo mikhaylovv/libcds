@@ -746,7 +746,6 @@ namespace cds { namespace intrusive {
                     if ( !item.ptr())  // imposible situation
                     {
                         bHadNullValue = true;
-                        if(!gen.next()) break;
                     }
                     else {
                         // If the item is not deleted yet
