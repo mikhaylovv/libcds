@@ -410,7 +410,7 @@ namespace cds { namespace intrusive {
                 }
 
 #           ifdef _DEBUG
-                assert( m_List.empty() || populated( m_List.back()));
+                assert( m_List.empty() || populated( m_List.back()) || tls_pTail.get() == tls_pHead.get());
 #           endif
 
                 segment * pNew = allocate_segment();
@@ -465,7 +465,7 @@ namespace cds { namespace intrusive {
                 m_Stat.onSegmentDeleted();
 
                 tls_pHead.reset(pRet);
-                tls_iHead.reset(new int( m_nQuasiFactor - 1 ));
+                tls_iHead.reset(new int(0) );
 
                 return pRet;
             }
@@ -500,7 +500,7 @@ namespace cds { namespace intrusive {
 
             static void tls_segment_cleanup( segment * )
             {
-                return;
+
             }
         };
         //@endcond
@@ -551,16 +551,16 @@ namespace cds { namespace intrusive {
             ++m_ItemCounter;
 
             if ( m_SegmentList.tls_pTail.get() != pTailSegment ){
-                m_SegmentList.tls_pTail.reset(pTailSegment);
+                m_SegmentList.tls_pTail.reset( pTailSegment );
                 m_SegmentList.tls_iTail.reset( new int(0) );
             }
 
-            int * iTail = m_SegmentList.tls_iTail.get();
-            int startGen = iTail ? *iTail: 0;
-
-            permutation_generator gen(startGen, quasi_factor());
-
             while ( true ) {
+
+                int * iTail = m_SegmentList.tls_iTail.get();
+                int startValue = iTail ? *iTail : 0;
+                permutation_generator gen /*(0, quasi_factor());*/( startValue, quasi_factor() - startValue);
+
                 CDS_DEBUG_ONLY( size_t nLoopCount = 0);
                 do {
                     typename permutation_generator::integer_type i = gen;
@@ -575,7 +575,7 @@ namespace cds { namespace intrusive {
                         if ( pTailSegment->cells[i].data.compare_exchange_strong( nullCell, regular_cell( &val ),
                             memory_model::memory_order_release, atomics::memory_order_relaxed ))
                         {
-                            m_SegmentList.tls_iTail.reset( new int(i) );
+                            m_SegmentList.tls_iTail.reset( new int(static_cast<int>(i)) );
 
                             // Ok to push item
                             m_Stat.onPush();
@@ -584,9 +584,7 @@ namespace cds { namespace intrusive {
                         assert( nullCell.ptr());
                         m_Stat.onPushContended();
                     }
-                } while ( gen.next());
-
-                assert( nLoopCount == quasi_factor());
+                } while ( gen.next() );
 
                 // No available position, create a new segment
                 pTailSegment = m_SegmentList.create_tail( pTailSegment, segmentGuard );
@@ -717,8 +715,6 @@ namespace cds { namespace intrusive {
                 m_SegmentList.tls_iHead.reset( new int(0) );
             }
 
-            int * iHead = m_SegmentList.tls_iHead.get();
-            int startGen = iHead ? *iHead : 0;
 
             while ( true ) {
                 if ( !pHeadSegment ) {
@@ -730,7 +726,9 @@ namespace cds { namespace intrusive {
                 bool bHadNullValue = false;
                 regular_cell item;
 
-                permutation_generator gen(startGen, quasi_factor());
+                int * iHead = m_SegmentList.tls_iHead.get();
+                int startValue = iHead ? *iHead : 0;
+                permutation_generator gen /*(0,quasi_factor());*/ ( startValue, quasi_factor() - startValue);
 
                 CDS_DEBUG_ONLY( size_t nLoopCount = 0 );
                 do {
@@ -745,8 +743,11 @@ namespace cds { namespace intrusive {
 
                     // Check if this cell is empty, which means an element
                     // can be enqueued to this cell in the future
-                    if ( !item.ptr())
+                    if ( !item.ptr())  // imposible situation
+                    {
                         bHadNullValue = true;
+                        if(!gen.next()) break;
+                    }
                     else {
                         // If the item is not deleted yet
                         if ( !item.bits()) {
@@ -754,7 +755,7 @@ namespace cds { namespace intrusive {
                             if ( pHeadSegment->cells[i].data.compare_exchange_strong( item, item | 1,
                                 memory_model::memory_order_acquire, atomics::memory_order_relaxed ))
                             {
-                                m_SegmentList.tls_iHead.reset( new int(i) );
+                                m_SegmentList.tls_iHead.reset( new int(static_cast<int>(i)) );
 
                                 --m_ItemCounter;
                                 m_Stat.onPop();
@@ -765,9 +766,8 @@ namespace cds { namespace intrusive {
                             m_Stat.onPopContended();
                         }
                     }
-                } while ( gen.next());
+                } while (gen.next());
 
-                assert( nLoopCount == quasi_factor());
 
                 // scanning the entire segment without finding a candidate to dequeue
                 // If there was an empty cell, the queue is considered empty
